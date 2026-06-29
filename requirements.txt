@@ -1,2 +1,5 @@
-requests>=2.31
-python-dotenv>=1.0
+requests
+responses
+pytest
+tenacity
+dotenv

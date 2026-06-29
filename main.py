@@ -5,15 +5,15 @@ Run: python main.py
 
 import logging
 import os
-
 from dotenv import load_dotenv
-
 from api_client import APIClient, APIError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 load_dotenv()
 
+# JSONPlaceholder is a free fake REST API service specifically designed for testing and learning
+# No auth required, supports all HTTP methods, different pagination modes and has a simple JSON structure.
 
 def main():
     client = APIClient(
@@ -32,12 +32,12 @@ def main():
     )
 
     # ── single GET ────────────────────────────────────────────────────────────
-    print("\n── Single GET /posts/1 ──")
+    print("\n── GET /posts/1 returns single post ──")
     post = client.call("GET", "/posts/1")
     print(f"  id={post['id']}  title={post['title'][:60]}")
 
     # ── single POST ───────────────────────────────────────────────────────────
-    print("\n── POST /posts ──")
+    print("\n── POST /posts returns array of ~100 posts ──")
     created = client.call("POST", "/posts", data={"title": "test", "body": "hello", "userId": 1})
     print(f"  created id={created.get('id')}  title={created.get('title')}")
 

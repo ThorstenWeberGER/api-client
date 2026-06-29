@@ -1,8 +1,10 @@
 # api_client — Generic REST API Client
 
-A minimal, self-contained HTTP client for REST APIs. Designed for a small data
-team that needs reliable API calls without the overhead of a heavy framework.
-Drop it in, configure via constructor kwargs, and go.
+> A minimal, self-contained HTTP client for REST APIs. Designed for a small data team that needs reliable API calls without the overhead of a heavy framework.
+
+Load it as a module into your api_script.py, configure via constructor kwargs, and go.
+
+See `main.py` as an example.
 
 ---
 
@@ -423,56 +425,31 @@ headers are set once on the `Session` rather than rebuilt per request.
 
 ### Why explicit constructor kwargs?
 
-Hardcoding values as named arguments rather than loading a config file means:
+In code visible values as arguments rather than loading a separate config file means:
 - **IDE completion and type hints** — editors show every option and its default.
-- **No file I/O at import time** — the client can be instantiated in tests or
-  Lambda cold starts without a config file present.
 - **Config lives next to the call site** — the `APIClient(...)` block in
   `main.py` is the single source of truth; no parallel YAML file to keep in sync.
 
 ### Why three pagination modes in one class?
 
-Different APIs in the data ecosystem use different conventions. Cursor mode
-covers modern APIs (HubSpot, Stripe); offset/limit covers SQL-backed services;
-page numbers cover GitHub and older frameworks. A single `paginate()` entry
-point with a `mode` parameter keeps the caller interface simple — one method
-to learn, three behaviours via config.
+Different APIs in the data ecosystem use different conventions. Cursor mode covers modern APIs (HubSpot, Stripe); offset/limit covers SQL-backed services; page numbers cover GitHub and older frameworks. A single `paginate()` entry point with a `mode` parameter keeps the caller interface simple — one method to learn, three behaviours via config.
 
 ### Why parse JSON before checking the HTTP status?
 
-Some APIs return meaningful JSON error bodies on 4xx responses (validation
-errors, rate-limit details). Others return plain text. Parsing best-effort
-first means callers always get the richest available information, but the HTTP
-status message always takes priority so the error is never misclassified as a
-parse failure.
+Some APIs return meaningful JSON error bodies on 4xx responses (validation errors, rate-limit details). Others return plain text. Parsing best-effort first means callers always get the richest available information, but the HTTP status message always takes priority so the error is never misclassified as a parse failure.
 
 ### Why `_LoggingRetry` instead of wrapping `call()`?
 
-Retry logic lives inside urllib3's connection pool. By the time `call()` sees a
-response, transient errors have already been retried silently. Wrapping `call()`
-with a try/except only catches failures after all retries are exhausted.
-Subclassing `Retry.increment()` is the only reliable hook that fires on every
-attempt — including the ones that succeed on a subsequent try.
+Retry logic lives inside urllib3's connection pool. By the time `call()` sees a response, transient errors have already been retried silently. Wrapping `call()` with a try/except only catches failures after all retries are exhausted. Subclassing `Retry.increment()` is the only reliable hook that fires on every attempt — including the ones that succeed on a subsequent try.
 
 ### Why `log.error` before raising, not just raising?
 
-Raising `APIError` passes the error to the caller, but not every caller logs
-it — some catch it and continue. `log.error` ensures the failure appears in
-the log stream immediately, regardless of what the caller does with the
-exception. This matters in pipeline contexts where a caught error might be
-silently skipped but still needs to be auditable.
+Raising `APIError` passes the error to the caller, but not every caller logs it — some catch it and continue. `log.error` ensures the failure appears in the log stream immediately, regardless of what the caller does with the exception. This matters in pipeline contexts where a caught error might be silently skipped but still needs to be auditable.
 
-### Why no async support?
-
-A four-person data team running batch pipelines does not need async I/O.
-Adding `asyncio` / `aiohttp` would double the interface surface and introduce
-a concurrency model that requires careful handling in Pandas/Snowflake contexts.
-The rate limiter already controls throughput. If you need parallelism,
-run multiple processes or use a job queue.
 
 ---
 
-## Strategic Options
+## Future Improvements
 
 ### Add API key rotation
 
@@ -497,22 +474,11 @@ Subclass `APIClient`, override `call()` to catch `APIError` with
 `status == 401`, refresh the token, update `self.api_key`, rebuild
 `self.session`, and retry once. The base `call()` stays unchanged.
 
-### Add response caching
-
-Wrap `call()` with a dict-based or Redis-based cache keyed on
-`(method, url, frozenset(params.items()))`. Only cache GET requests.
-
 ### Replace requests with httpx for async support
 
 Swap `requests.Session.request()` for `httpx.AsyncClient.request()` and make
 `call()` and `paginate()` async. The rate limiter becomes `asyncio.sleep(gap)`.
 `_LoggingRetry` becomes an httpx event hook. The public interface does not change.
-
-### Add Snowflake / database sink
-
-After collecting pages, write them to Snowflake using the existing
-`snowflake-connector-python` pattern in this repo:
-`cursor.executemany(sql, list_of_dicts)`.
 
 ---
 
