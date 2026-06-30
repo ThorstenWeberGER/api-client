@@ -48,7 +48,6 @@ The library is organized around three layers:
 
 All three share common helpers:
 - `_items(res)`: Extracts items list from bare array or dict wrapper
-- `_meta(res, key)`: Safe dict-key lookup (returns None for arrays)
 - `_truncate_to_limit(items, total_rows, max_rows)`: Applies per-call row cap
 
 ## Key Design Patterns
@@ -115,7 +114,7 @@ This avoids losing transient-success retries that would be invisible if wrapped 
 All three pagination modes share:
 - Same entry point: `client.paginate(path, params, mode, max_rows)`
 - Same generator interface: yields one page at a time
-- Same helpers: `_items()`, `_meta()`, `_truncate_to_limit()`
+- Same helpers: `_items()`, `_truncate_to_limit()`
 - Same stop logic: empty page, partial page, exhausted total/cursor, or `max_rows` hit
 
 Users select the mode that matches their API:
@@ -157,7 +156,6 @@ Log levels:
 | `_throttle()` | Enforce minimum inter-request delay |
 | `_http_error_msg(method, path, status, body)` | Build actionable error message |
 | `_items(res)` | Extract items list from response (bare array or dict) |
-| `_meta(res, key)` | Safe dict-key lookup (None for non-dicts) |
 | `_truncate_to_limit(items, total_rows, max_rows)` | Apply per-call row cap |
 | `_paginate_cursor(path, params, page_size, max_rows)` | Cursor-based pagination impl |
 | `_paginate_offset(path, params, page_size, max_rows)` | Offset-based pagination impl |

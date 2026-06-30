@@ -53,7 +53,7 @@ flowchart TD
             end
 
             subgraph HG["Page Helpers — used by all three paginators on every page"]
-                HELPERS["_items(res)\nExtracts items list from any response shape.\nBare JSON array → returned directly.\nDict → returns res.get(data_key) or empty list.\n- - - - - - - - - - - - - - - -\n_meta(res, key)\nSafe key lookup on a page response.\nDict → res.get(key). Bare array → None.\nUsed to read cursor token and total count.\n- - - - - - - - - - - - - - - -\n_truncate_to_limit(items, total_rows, max_rows)\nremaining = max_rows - total_rows_so_far\nlen >= remaining: return truncated list, True\nlen < remaining: return items, False\nTrue = stop signal. Shared by all three paginators."]
+                HELPERS["_items(res)\nExtracts items list from any response shape.\nBare JSON array → returned directly.\nDict → returns res.get(data_key) or empty list.\n- - - - - - - - - - - - - - - -\n_truncate_to_limit(items, total_rows, max_rows)\nremaining = max_rows - total_rows_so_far\nlen >= remaining: return truncated list, True\nlen < remaining: return items, False\nTrue = stop signal. Shared by all three paginators."]
             end
 
         end
@@ -539,7 +539,6 @@ never interact with it directly.
 | `_throttle()` | Enforce minimum inter-request delay |
 | `_http_error_msg(method, path, status, body)` | Build actionable error message with remediation hint |
 | `_items(res)` | Extract items list from response (bare array or dict wrapper) |
-| `_meta(res, key)` | Safe dict-key lookup; returns `None` for bare arrays |
 | `_deep_get(obj, key_path, default)` | Traverse a nested dict using a dot-notation key path |
 | `_truncate_to_limit(items, total_rows, max_rows)` | Apply per-call row cap; returns `(items, stop_flag)` |
 | `_paginate_cursor(path, params, page_size, max_rows)` | Cursor-based pagination implementation |

@@ -45,6 +45,8 @@ from urllib3.util.retry import Retry
 
 log = logging.getLogger(__name__)
 
+_MISSING = object()
+
 
 # ── retry with logging ────────────────────────────────────────────────────────
 
@@ -373,7 +375,7 @@ class APIClient:
 
     # ── core HTTP request ─────────────────────────────────────────────────────
 
-    def request(self, method: str, path: str, data=None, params=None):
+    def request(self, method, path, data=None, params=None):
         """Send one HTTP request and return the parsed response.
 
         Applies rate limiting before every request. 429 and 5xx retries
@@ -429,9 +431,13 @@ class APIClient:
             # produce a specific, actionable error message instead of a generic one.
             # responses library uses implicit chaining (__context__), not __cause__.
             chain = e.__cause__ or e.__context__
-            reason = getattr(chain, "reason", None)
-            m = re.search(r"\b([45]\d{2})\b", str(reason) if reason is not None else str(e))
-            status = int(m.group(1)) if m else None
+            response = getattr(chain, "response", None)
+            status = getattr(response, "status", None)
+            if status is None:
+                reason = getattr(chain, "reason", None)
+                if reason is not None:
+                    m = re.search(r"\b([45]\d{2})\b", str(reason))
+                    status = int(m.group(1)) if m else None
             if status is not None:
                 msg = self._http_error_msg(method, path, status, None)
                 msg += f" (failed after {self.max_retries} retries)"
@@ -458,9 +464,9 @@ class APIClient:
             payload = None
 
         if not (200 <= r.status_code < 300):
-            msg = self._http_error_msg(method, path, r.status_code, payload or r.content[:200])
+            msg = self._http_error_msg(method, path, r.status_code, payload if payload is not None else r.content[:200])
             log.error(msg)
-            raise APIError(msg, status=r.status_code, body=payload or r.content)
+            raise APIError(msg, status=r.status_code, body=payload if payload is not None else r.content)
 
         if payload is None:
             msg = (
@@ -476,7 +482,7 @@ class APIClient:
 
     # ── HTTP method convenience wrappers ──────────────────────────────────────
 
-    def get(self, path: str, params=None):
+    def get(self, path, params=None):
         """Send a GET request and return the parsed response.
 
         Args:
@@ -496,7 +502,7 @@ class APIClient:
         """
         return self.request("GET", path, params=params)
 
-    def post(self, path: str, data=None, params=None):
+    def post(self, path, data=None, params=None):
         """Send a POST request and return the parsed response.
 
         Used for creating resources and for APIs (like HubSpot CRM search)
@@ -526,7 +532,7 @@ class APIClient:
         """
         return self.request("POST", path, data=data, params=params)
 
-    def put(self, path: str, data=None, params=None):
+    def put(self, path, data=None, params=None):
         """Send a PUT request and return the parsed response.
 
         Args:
@@ -546,7 +552,7 @@ class APIClient:
         """
         return self.request("PUT", path, data=data, params=params)
 
-    def patch(self, path: str, data=None, params=None):
+    def patch(self, path, data=None, params=None):
         """Send a PATCH request and return the parsed response.
 
         Args:
@@ -566,11 +572,12 @@ class APIClient:
         """
         return self.request("PATCH", path, data=data, params=params)
 
-    def delete(self, path: str, params=None):
+    def delete(self, path, data=None, params=None):
         """Send a DELETE request and return the parsed response.
 
         Args:
             path (str): Endpoint path (e.g. ``"/orders/99"``).
+            data (dict, optional): Request body, serialised to JSON.
             params (dict, optional): Query-string parameters.
 
         Returns:
@@ -583,9 +590,9 @@ class APIClient:
 
             client.delete("/orders/99")
         """
-        return self.request("DELETE", path, params=params)
+        return self.request("DELETE", path, data=data, params=params)
 
-    def graphql(self, query: str, variables=None, path: str = "/graphql"):
+    def graphql(self, query, variables=None, path="/graphql"):
         """Execute a GraphQL query via HTTP POST.
 
         GraphQL APIs accept queries as POST requests with a JSON body
@@ -633,8 +640,7 @@ class APIClient:
 
     # ── POST-based search / pagination (HubSpot CRM style) ───────────────────
 
-    def search(self, path: str, body=None, page_size: int = None,
-               max_rows: int = None):
+    def search(self, path, body=None, page_size=None, max_rows=None):
         """POST-based cursor pagination for HubSpot-style search APIs.
 
         HubSpot CRM search endpoints accept filter criteria in the POST body
@@ -693,7 +699,7 @@ class APIClient:
 
     # ── pagination helpers ────────────────────────────────────────────────────
 
-    def _items(self, res) -> list:
+    def _items(self, res):
         """Extract the items list from a response.
 
         Handles two common API response shapes: a bare JSON array returned
@@ -709,18 +715,6 @@ class APIClient:
         if isinstance(res, list):
             return res
         return res.get(self.data_key, [])
-
-    def _meta(self, res, key):
-        """Return ``res[key]`` when ``res`` is a dict, else ``None``.
-
-        Args:
-            res (dict | list): Parsed response returned by ``request()``.
-            key (str): Key to look up.
-
-        Returns:
-            Any | None: The value at ``key``, or ``None``.
-        """
-        return res.get(key) if isinstance(res, dict) else None
 
     @staticmethod
     def _deep_get(obj, key_path, default=None):
@@ -750,12 +744,12 @@ class APIClient:
         for key in key_path.split("."):
             if not isinstance(obj, dict):
                 return default
-            obj = obj.get(key, default)
-            if obj is default:
+            obj = obj.get(key, _MISSING)
+            if obj is _MISSING:
                 return default
         return obj
 
-    def _truncate_to_limit(self, items: list, total_rows: int, max_rows) -> tuple:
+    def _truncate_to_limit(self, items, total_rows, max_rows):
         """Truncate ``items`` to the ``max_rows`` cap.
 
         Args:
@@ -776,8 +770,7 @@ class APIClient:
 
     # ── GET-based pagination ──────────────────────────────────────────────────
 
-    def paginate(self, path: str, params=None, page_size: int = None,
-                 mode: str = None, max_rows: int = None):
+    def paginate(self, path, params=None, page_size=None, mode=None, max_rows=None):
         """Paginate a GET endpoint and yield one page at a time.
 
         All three modes stop automatically when the API signals the last
@@ -873,6 +866,8 @@ class APIClient:
                     log.debug("Cursor: empty response on page %d — done", page_num)
                     break
                 items, limit_reached = self._truncate_to_limit(items, total_rows, max_rows)
+                if not items:
+                    break
                 log.debug("Cursor: page %d → %d items", page_num, len(items))
                 total_rows += len(items)
                 yield items
@@ -880,7 +875,7 @@ class APIClient:
                     log.info("max_rows (%d) reached after page %d — stopping", max_rows, page_num)
                     break
                 cursor = self._deep_get(res, self.cursor_key)
-                if cursor is None or cursor == "":
+                if cursor is None or cursor is False or cursor == "":
                     log.debug("Cursor: no cursor after page %d — done", page_num)
                     break
                 p[self.cursor_param] = cursor
@@ -930,6 +925,8 @@ class APIClient:
                     log.debug("Offset: empty response on page %d — done", page_num)
                     break
                 items, limit_reached = self._truncate_to_limit(items, total_rows, max_rows)
+                if not items:
+                    break
                 log.debug("Offset: page %d → %d items", page_num, len(items))
                 total_rows += len(items)
                 yield items
@@ -994,6 +991,8 @@ class APIClient:
                     log.debug("Page: empty response on page %d — done", page)
                     break
                 items, limit_reached = self._truncate_to_limit(items, total_rows, max_rows)
+                if not items:
+                    break
                 log.debug("Page: page %d → %d items", page, len(items))
                 total_rows += len(items)
                 yield items
@@ -1044,6 +1043,8 @@ class APIClient:
                     log.debug("Search: empty response on page %d — done", page_num)
                     break
                 items, limit_reached = self._truncate_to_limit(items, total_rows, max_rows)
+                if not items:
+                    break
                 log.debug("Search: page %d → %d items", page_num, len(items))
                 total_rows += len(items)
                 yield items
@@ -1051,7 +1052,7 @@ class APIClient:
                     log.info("max_rows (%d) reached after page %d — stopping", max_rows, page_num)
                     break
                 cursor = self._deep_get(res, self.cursor_key)
-                if cursor is None or cursor == "":
+                if cursor is None or cursor is False or cursor == "":
                     log.debug("Search: no cursor after page %d — done", page_num)
                     break
                 b[self.cursor_body_key] = cursor
