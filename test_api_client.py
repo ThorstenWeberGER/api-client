@@ -200,35 +200,60 @@ class TestHttpErrors(unittest.TestCase):
         client = make_client()
         with self.assertRaises(APIError) as ctx:
             self._call(client, 401)
-        self.assertIn("Authentication failed", str(ctx.exception))
-        self.assertIn("API_KEY", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("credentials", msg.lower())
+        self.assertIn("API_KEY", msg)
         self.assertEqual(ctx.exception.status, 401)
 
-    def test_403_raises_with_auth_message(self):
+    def test_403_raises_with_permission_message(self):
         client = make_client()
         with self.assertRaises(APIError) as ctx:
             self._call(client, 403)
-        self.assertIn("Authentication failed", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("denied", msg.lower())
+        self.assertIn("permission", msg.lower())
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_401_and_403_produce_different_messages(self):
+        client = make_client()
+        with self.assertRaises(APIError) as ctx401:
+            self._call(client, 401)
+        with self.assertRaises(APIError) as ctx403:
+            self._call(client, 403)
+        self.assertNotEqual(str(ctx401.exception), str(ctx403.exception))
 
     def test_404_raises_with_not_found_message(self):
         client = make_client()
         with self.assertRaises(APIError) as ctx:
             self._call(client, 404)
-        self.assertIn("not found", str(ctx.exception).lower())
+        msg = str(ctx.exception).lower()
+        self.assertTrue(
+            "not found" in msg or "does not exist" in msg,
+            f"Expected 'not found' or 'does not exist' in: {msg}",
+        )
         self.assertEqual(ctx.exception.status, 404)
 
     def test_500_raises_with_server_error_message(self):
         client = make_client()
         with self.assertRaises(APIError) as ctx:
             self._call(client, 500)
-        self.assertIn("Server error", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("internal error", msg.lower())
         self.assertEqual(ctx.exception.status, 500)
 
-    def test_422_raises_with_client_error_message(self):
+    def test_500_and_503_produce_different_messages(self):
+        client = make_client()
+        with self.assertRaises(APIError) as ctx500:
+            self._call(client, 500)
+        with self.assertRaises(APIError) as ctx503:
+            self._call(client, 503)
+        self.assertNotEqual(str(ctx500.exception), str(ctx503.exception))
+
+    def test_422_raises_with_validation_message(self):
         client = make_client()
         with self.assertRaises(APIError) as ctx:
             self._call(client, 422)
-        self.assertIn("Client error", str(ctx.exception))
+        self.assertIn("validation", str(ctx.exception).lower())
 
     def test_network_error_raises_api_error(self):
         client = make_client()

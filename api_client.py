@@ -35,6 +35,7 @@ Typical usage::
 """
 
 import logging
+import re
 import time
 
 import requests
@@ -235,6 +236,7 @@ class APIClient:
         self.offset_param    = offset_param
         self.limit_param     = limit_param
         self.max_rows        = max_rows
+        self.max_retries     = max_retries
         self._last_call      = 0.0
         self.session         = self._build_session(api_key, max_retries)
 
@@ -294,30 +296,80 @@ class APIClient:
     def _http_error_msg(self, method: str, path: str, status: int, body) -> str:
         """Build an actionable error message for a non-2xx HTTP response.
 
+        Each message follows a two-sentence structure: what went wrong, then
+        what to do about it. Status codes with distinct root causes and distinct
+        remediation steps get their own branch; codes with the same fix are
+        grouped (e.g. 502/503/504 are all "upstream unavailable, retry").
+
         Args:
             method (str): HTTP method (e.g. ``"GET"``).
             path (str): Request path (e.g. ``"/users/42"``).
             status (int): HTTP status code.
             body (dict | list | bytes): Parsed or raw response body,
-                included in generic 4xx messages for debugging.
+                appended to messages for 4xx errors to aid debugging.
 
         Returns:
             str: Human-readable message with a specific remediation hint.
         """
         tag = f"[{method} {path}] HTTP {status}"
-        if status in (401, 403):
+        if status == 400:
             return (
-                f"{tag} — Authentication failed. "
-                f"Check your API key or token (env var '{self.api_key_env}')."
+                f"{tag} — The server rejected the request as malformed or missing required fields. "
+                f"Check the request body and parameters against the API documentation. "
+                f"Response: {body!r}"
+            )
+        if status == 401:
+            return (
+                f"{tag} — Authentication credentials were missing or rejected by the server. "
+                f"Pass a valid API key via the 'api_key' argument "
+                f"(env var '{self.api_key_env}')."
+            )
+        if status == 403:
+            return (
+                f"{tag} — Access to this resource was denied despite valid credentials. "
+                f"Your account lacks the required permission; check the API's "
+                f"access-control settings or contact the API owner."
             )
         if status == 404:
-            return f"{tag} — Endpoint not found. Verify the path and resource ID."
+            return (
+                f"{tag} — The requested resource does not exist at this path. "
+                f"Verify the path and resource ID are correct and the resource "
+                f"has not been deleted."
+            )
+        if status == 422:
+            return (
+                f"{tag} — The request was understood but the data failed validation. "
+                f"Review the field requirements and constraints for this endpoint. "
+                f"Response: {body!r}"
+            )
+        if status == 429:
+            return (
+                f"{tag} — The API rejected this request because the rate limit was reached. "
+                f"Increase 'rate_delay' to add more spacing between requests, "
+                f"or reduce concurrency."
+            )
+        if status == 500:
+            return (
+                f"{tag} — The server encountered an internal error processing the request. "
+                f"This is a bug on the API's side; report it to the maintainer "
+                f"or check their status page."
+            )
+        if status in (502, 503, 504):
+            return (
+                f"{tag} — The API gateway or upstream service is temporarily unavailable. "
+                f"Wait a few minutes and retry, or check the API status page."
+            )
+        if 400 <= status <= 499:
+            return (
+                f"{tag} — Client error: the server could not process this request. "
+                f"Check the request parameters and body. Response: {body!r}"
+            )
         if 500 <= status <= 599:
-            return f"{tag} — Server error. Retry later or check the API status page."
-        return (
-            f"{tag} — Client error. "
-            f"Check request parameters or body. Response: {body!r}"
-        )
+            return (
+                f"{tag} — The server returned an unexpected error. "
+                f"Retry later or check the API status page."
+            )
+        return f"{tag} — Unexpected HTTP status. Response: {body!r}"
 
     # ── core HTTP request ─────────────────────────────────────────────────────
 
@@ -371,6 +423,23 @@ class APIClient:
             r = self.session.request(
                 method, url, params=params, json=data, timeout=self.timeout
             )
+        except requests.exceptions.RetryError as e:
+            # urllib3 exhausted retries on a status in status_forcelist (429/5xx).
+            # The status code is buried in the reason string; extract it so we can
+            # produce a specific, actionable error message instead of a generic one.
+            # responses library uses implicit chaining (__context__), not __cause__.
+            chain = e.__cause__ or e.__context__
+            reason = getattr(chain, "reason", None)
+            m = re.search(r"\b([45]\d{2})\b", str(reason) if reason is not None else str(e))
+            status = int(m.group(1)) if m else None
+            if status is not None:
+                msg = self._http_error_msg(method, path, status, None)
+                msg += f" (failed after {self.max_retries} retries)"
+                log.error(msg)
+                raise APIError(msg, status=status, body=str(e)) from e
+            msg = f"[{method} {path}] Retries exhausted — {e}"
+            log.error(msg)
+            raise APIError(msg, body=str(e)) from e
         except requests.RequestException as e:
             msg = f"[{method} {path}] Request failed — {type(e).__name__}: {e}"
             log.error(msg)
