@@ -42,7 +42,7 @@ flowchart TD
             subgraph RG["Request Layer"]
                 THROTTLE["_throttle()\ngap = rate_delay - elapsed since last call\nSleeps only the remaining gap\nFirst call never sleeps (_last_call starts at 0.0)"]
                 ERRMSG["_http_error_msg()\n401 or 403 → check API key hint\n404 → verify path hint\n5xx → retry later hint\nother 4xx → shows response preview"]
-                CALL["call(method, path, data, params)\n1. _throttle()\n2. session.request() retried by _LoggingRetry\n3. parse JSON best-effort\n4. non-2xx → _http_error_msg() → raise APIError\nReturns dict or list on success"]
+                CALL["request(method, path, data, params)\n1. _throttle()\n2. session.request() retried by _LoggingRetry\n3. parse JSON best-effort\n4. non-2xx → _http_error_msg() → raise APIError\nReturns dict or list on success"]
             end
 
             subgraph PG["Pagination Layer"]
@@ -59,7 +59,7 @@ flowchart TD
         end
     end
 
-    CALLER["main.py — Caller\nAPIClient(base_url=..., api_key=..., ...)\nclient.call() and client.paginate()\ntry/except APIError"]
+    CALLER["main.py — Caller\nAPIClient(base_url=..., api_key=..., ...)\nclient.get() / client.post() / client.request()\nclient.paginate() / client.graphql() / client.search()\ntry/except APIError"]
 
     U -->|extends| LR
     LR -->|used in| BUILD
@@ -123,8 +123,12 @@ client = APIClient(
     api_key  = os.environ.get("API_KEY", ""),
 )
 
-# Single request
-user = client.call("GET", "/users/42")
+# Single requests — convenience methods
+user   = client.get("/users/42")
+order  = client.post("/orders", data={"item": "widget", "qty": 3})
+_      = client.put("/orders/7", data={"qty": 5})
+_      = client.patch("/orders/7", data={"status": "shipped"})
+_      = client.delete("/orders/99")
 
 # Paginate — yields one page (list) at a time
 for page in client.paginate("/orders", params={"status": "open"}):
@@ -137,7 +141,7 @@ for page in client.paginate("/events", max_rows=500):
 
 # Error handling
 try:
-    client.call("GET", "/protected")
+    client.get("/protected")
 except APIError as e:
     print(e.status, e)   # 401  [GET /protected] HTTP 401 — Authentication failed ...
 ```
@@ -171,11 +175,35 @@ All configuration is passed as keyword arguments to `APIClient()`. No files are 
 | `timeout` | `30` | HTTP request timeout in seconds. |
 | `pagination_mode` | `"cursor"` | Default pagination strategy: `"cursor"`, `"offset"`, or `"page"`. |
 | `data_key` | `"data"` | Dict key holding the items list in paginated responses. Ignored when the API returns a bare JSON array. |
-| `cursor_key` | `"next_cursor"` | Cursor mode: response key carrying the next-page token. |
+| `cursor_key` | `"next_cursor"` | Cursor mode: response key carrying the next-page token. Supports dot-notation (e.g. `"paging.next.after"`). |
+| `cursor_param` | `"cursor"` | Cursor mode (GET): query-parameter name used to send the cursor on subsequent requests. Set to `"after"` for GitHub, `"page_token"` for Google, `"starting_after"` for Stripe. |
 | `total_key` | `"total"` | Offset mode: response key carrying the total record count (enables early-stop). |
 | `offset_param` | `"offset"` | Query-parameter name for the offset value (e.g. `"_start"` for JSONPlaceholder). |
 | `limit_param` | `"limit"` | Query-parameter name for the page size, used by all three pagination modes. |
 | `max_rows` | `None` | Cap total items returned across all pages. `None` fetches everything. Can be overridden per `paginate()` call. |
+| `cursor_body_key` | `"after"` | Key in the POST body to carry the next-page cursor. Used by `search()` (POST-based pagination). |
+
+---
+
+## Retry, Backoff, and Timeout
+
+Configure retry behaviour and timing entirely through the constructor:
+
+```python
+client = APIClient(
+    base_url    = "https://api.example.com",
+    api_key     = os.environ.get("API_KEY", ""),
+    max_retries = 4,      # retry up to 4 times on 429 / 5xx
+    timeout     = 30,     # seconds per request
+    rate_delay  = 1.0,    # minimum gap between requests (1 req/s)
+)
+```
+
+**Backoff schedule** (with `backoff_factor=1`, fixed internally): 0 s, 2 s, 4 s, 8 s. This is not configurable via the constructor.
+
+**Retried status codes:** 429, 500, 502, 503, 504. The `Retry-After` header is respected when the server sends it — urllib3 honours it automatically.
+
+After `max_retries` attempts are exhausted, an `APIError` is raised and logged at `ERROR`.
 
 ---
 
@@ -271,6 +299,81 @@ for page in client.paginate("/events", max_rows=500):
 
 ---
 
+## GraphQL
+
+The client natively supports GraphQL APIs — they use HTTP POST, so no special transport is needed. Use the `graphql()` helper to send queries cleanly:
+
+```python
+# One-off GraphQL query
+result = client.graphql(
+    "{ user(id: 1) { name email } }",
+    path="/graphql",          # defaults to /graphql
+)
+
+# With variables
+result = client.graphql(
+    query     = "query GetUser($id: ID!) { user(id: $id) { name email } }",
+    variables = {"id": "42"},
+)
+```
+
+`graphql()` sends `POST /graphql` with body `{"query": "...", "variables": {...}}` and returns the parsed response.
+
+**Pagination over GraphQL is manual.** GraphQL schemas vary too widely to automate cursor extraction. Use `graphql()` in a loop and parse the cursor from the response yourself:
+
+```python
+cursor = None
+while True:
+    result = client.graphql(
+        query     = "query ($after: String) { orders(first: 100, after: $after) { edges { node { id } } pageInfo { endCursor hasNextPage } } }",
+        variables = {"after": cursor},
+    )
+    orders = result["data"]["orders"]
+    process(orders["edges"])
+    if not orders["pageInfo"]["hasNextPage"]:
+        break
+    cursor = orders["pageInfo"]["endCursor"]
+```
+
+---
+
+## HubSpot-style POST Search Pagination
+
+Some APIs — most notably HubSpot CRM search — use `POST` for fetching paginated data. The cursor for the next page is sent in the **POST body**, not as a query parameter.
+
+Use the `search()` method with two extra constructor params:
+
+- `cursor_body_key` (default `"after"`) — key in the POST body to set the next-page cursor.
+- `cursor_key` now supports **dot-notation paths** (e.g., `"paging.next.after"`) to reach nested cursor values in the response.
+
+```python
+client = APIClient(
+    base_url         = "https://api.hubapi.com",
+    api_key          = os.environ.get("HUBSPOT_API_KEY"),
+    data_key         = "results",           # HubSpot wraps items in "results"
+    cursor_key       = "paging.next.after", # dot-notation nested path
+    cursor_body_key  = "after",             # sent in POST body for next page
+    limit_param      = "limit",
+)
+
+for page in client.search(
+    "/crm/v3/objects/contacts/search",
+    body = {
+        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "CONTAINS_TOKEN", "value": "example.com"}]}],
+        "properties": ["email", "firstname", "lastname"],
+    },
+    max_rows = 500,
+):
+    for contact in page:
+        process(contact)
+```
+
+`search()` sends `POST` for every page. On each subsequent page it merges `{cursor_body_key: <cursor>}` into the POST body. It stops when there is no cursor in the response, the page is empty, or `max_rows` is reached.
+
+The internal `_deep_get(obj, key_path, default)` helper handles dot-notation traversal, so `cursor_key = "paging.next.after"` correctly extracts deeply nested cursor values from the response dict.
+
+---
+
 ## Error Handling
 
 All failures raise `APIError`. Catch it specifically — never catch bare
@@ -280,7 +383,7 @@ All failures raise `APIError`. Catch it specifically — never catch bare
 from api_client import APIClient, APIError
 
 try:
-    data = client.call("GET", "/protected-resource")
+    data = client.get("/protected-resource")
 except APIError as e:
     print(e.status)   # HTTP status code (int), or None for network/parse failures
     print(e.body)     # parsed dict/list, raw bytes, or str error message
@@ -328,20 +431,20 @@ No handlers are configured inside the library — that is always left to the cal
 | `DEBUG` | `__init__` | Client config on startup: base URL, rate delay, retries, pagination mode |
 | `DEBUG` | `__init__` | `"APIClient ready: https://…"` after successful initialisation |
 | `DEBUG` | `_throttle` | `"Rate-limiting: sleeping 0.340s"` — only when a sleep actually happens |
-| `DEBUG` | `call` | Full request URL before the request is sent |
-| `DEBUG` | `call` | `"JSON parse failed — …"` when a response body is not valid JSON |
-| `DEBUG` | `call` | Response byte size on success |
-| `DEBUG` | `call` | `"empty/no-content response"` on HTTP 204 |
+| `DEBUG` | `request` | Full request URL before the request is sent |
+| `DEBUG` | `request` | `"JSON parse failed — …"` when a response body is not valid JSON |
+| `DEBUG` | `request` | Response byte size on success |
+| `DEBUG` | `request` | `"empty/no-content response"` on HTTP 204 |
 | `DEBUG` | pagination | `"Starting pagination: path=… mode=… page_size=… max_rows=…"` |
 | `DEBUG` | pagination | `"Fetching page N"` with offset/cursor/page details |
 | `DEBUG` | pagination | `"Page N → X items"` after each successful page |
 | `DEBUG` | pagination | Stop-reason message: empty response / no cursor / partial page / total reached |
-| `INFO` | `call` | `"GET /orders → HTTP 200"` — one line per HTTP request/response |
+| `INFO` | `request` | `"GET /orders → HTTP 200"` — one line per HTTP request/response |
 | `INFO` | `_LoggingRetry` | `"Rate-limited (HTTP 429): … — 3 attempt(s) remaining"` |
 | `INFO` | pagination | `"max_rows (N) reached after page P — stopping"` |
 | `INFO` | pagination | `"Offset pagination complete: /orders — 5 pages, 487 rows total"` |
-| `ERROR` | `call` | Full actionable message before every `APIError` is raised |
-| `ERROR` | `call` | `"[GET /orders] Request failed — ConnectionError: …"` on network failure |
+| `ERROR` | `request` | Full actionable message before every `APIError` is raised |
+| `ERROR` | `request` | `"[GET /orders] Request failed — ConnectionError: …"` on network failure |
 | `ERROR` | `_LoggingRetry` | `"Max retries exhausted: GET … — last status HTTP 500"` |
 
 ### Activating logging
@@ -412,13 +515,47 @@ never interact with it directly.
 
 ---
 
+## Method Reference
+
+### Public Methods
+
+| Method | Purpose |
+|---|---|
+| `request(method, path, data, params)` | Low-level: send any HTTP request, return parsed JSON |
+| `get(path, params)` | Shorthand for GET requests |
+| `post(path, data, params)` | Shorthand for POST requests |
+| `put(path, data, params)` | Shorthand for PUT requests |
+| `patch(path, data, params)` | Shorthand for PATCH requests |
+| `delete(path, params)` | Shorthand for DELETE requests |
+| `graphql(query, variables, path)` | Execute a GraphQL query via POST |
+| `paginate(path, params, page_size, mode, max_rows)` | Generator that yields pages; supports cursor, offset, and page modes |
+| `search(path, body, page_size, max_rows)` | POST-based cursor pagination (HubSpot-style) |
+
+### Private Methods
+
+| Method | Purpose |
+|---|---|
+| `_build_session(api_key, max_retries)` | Create `requests.Session` with retry adapter |
+| `_throttle()` | Enforce minimum inter-request delay |
+| `_http_error_msg(method, path, status, body)` | Build actionable error message with remediation hint |
+| `_items(res)` | Extract items list from response (bare array or dict wrapper) |
+| `_meta(res, key)` | Safe dict-key lookup; returns `None` for bare arrays |
+| `_deep_get(obj, key_path, default)` | Traverse a nested dict using a dot-notation key path |
+| `_truncate_to_limit(items, total_rows, max_rows)` | Apply per-call row cap; returns `(items, stop_flag)` |
+| `_paginate_cursor(path, params, page_size, max_rows)` | Cursor-based pagination implementation |
+| `_paginate_offset(path, params, page_size, max_rows)` | Offset-based pagination implementation |
+| `_paginate_pages(path, params, page_size, max_rows)` | Page-number pagination implementation |
+| `_paginate_search(path, body, page_size, max_rows)` | POST cursor pagination implementation (used by `search()`) |
+
+---
+
 ## Key Design Decisions
 
 ### Why requests?
 
 `requests` wraps urllib3 with a cleaner interface: `session.request()` handles
 URL encoding, JSON body serialisation, and auth headers automatically, removing
-~20 lines of manual plumbing from `call()`. Because `requests` uses urllib3
+~20 lines of manual plumbing from `request()`. Because `requests` uses urllib3
 internally, `HTTPAdapter(max_retries=_LoggingRetry(...))` works without
 modification — our retry logging hook survives the switch unchanged. Auth
 headers are set once on the `Session` rather than rebuilt per request.
@@ -438,9 +575,9 @@ Different APIs in the data ecosystem use different conventions. Cursor mode cove
 
 Some APIs return meaningful JSON error bodies on 4xx responses (validation errors, rate-limit details). Others return plain text. Parsing best-effort first means callers always get the richest available information, but the HTTP status message always takes priority so the error is never misclassified as a parse failure.
 
-### Why `_LoggingRetry` instead of wrapping `call()`?
+### Why `_LoggingRetry` instead of wrapping `request()`?
 
-Retry logic lives inside urllib3's connection pool. By the time `call()` sees a response, transient errors have already been retried silently. Wrapping `call()` with a try/except only catches failures after all retries are exhausted. Subclassing `Retry.increment()` is the only reliable hook that fires on every attempt — including the ones that succeed on a subsequent try.
+Retry logic lives inside urllib3's connection pool. By the time `request()` sees a response, transient errors have already been retried silently. Wrapping `request()` with a try/except only catches failures after all retries are exhausted. Subclassing `Retry.increment()` is the only reliable hook that fires on every attempt — including the ones that succeed on a subsequent try.
 
 ### Why `log.error` before raising, not just raising?
 
@@ -470,14 +607,14 @@ for a JSON formatter such as `python-json-logger`.
 
 ### Switch to OAuth 2.0 / token refresh
 
-Subclass `APIClient`, override `call()` to catch `APIError` with
+Subclass `APIClient`, override `request()` to catch `APIError` with
 `status == 401`, refresh the token, update `self.api_key`, rebuild
-`self.session`, and retry once. The base `call()` stays unchanged.
+`self.session`, and retry once. The base `request()` stays unchanged.
 
 ### Replace requests with httpx for async support
 
 Swap `requests.Session.request()` for `httpx.AsyncClient.request()` and make
-`call()` and `paginate()` async. The rate limiter becomes `asyncio.sleep(gap)`.
+`request()` and `paginate()` async. The rate limiter becomes `asyncio.sleep(gap)`.
 `_LoggingRetry` becomes an httpx event hook. The public interface does not change.
 
 ---

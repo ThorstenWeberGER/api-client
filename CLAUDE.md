@@ -65,6 +65,7 @@ client = APIClient(
     pagination_mode = "cursor", # cursor | offset | page
     data_key = "data",          # Dict wrapper key for items
     cursor_key = "next_cursor", # Cursor token key
+    cursor_param = "cursor",    # Query-param name for cursor in GET requests
     total_key = "total",        # Total count key (offset mode)
     offset_param = "offset",    # Offset query-param name
     limit_param = "limit",      # Limit query-param name
@@ -82,7 +83,7 @@ No config files are read. This design ensures:
 All failures raise `APIError` (never bare `Exception`):
 ```python
 try:
-    data = client.call("GET", "/users/42")
+    data = client.get("/users/42")
 except APIError as e:
     print(e.status)   # int or None (None = network/parse failure)
     print(e.body)     # dict/list/bytes/str
@@ -196,7 +197,7 @@ def mock_response(status: int, body):
 # Usage in a test:
 client = make_client()
 client.session.request.return_value = mock_response(200, {"id": 1})
-result = client.call("GET", "/posts/1")
+result = client.get("/posts/1")
 assert result == {"id": 1}
 ```
 
@@ -378,7 +379,7 @@ for page in client.paginate("/legacy", mode="offset", max_rows=500):
 from api_client import APIError
 
 try:
-    client.call("GET", "/protected")
+    client.get("/protected")
 except APIError as e:
     if e.status == 401:
         # Refresh token
