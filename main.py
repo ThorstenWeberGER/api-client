@@ -33,12 +33,12 @@ def main():
 
     # ── single GET ────────────────────────────────────────────────────────────
     print("\n── GET /posts/1 returns single post ──")
-    post = client.call("GET", "/posts/1")
+    post = client.get("/posts/1")
     print(f"  id={post['id']}  title={post['title'][:60]}")
 
     # ── single POST ───────────────────────────────────────────────────────────
     print("\n── POST /posts returns array of ~100 posts ──")
-    created = client.call("POST", "/posts", data={"title": "test", "body": "hello", "userId": 1})
+    created = client.post("/posts", data={"title": "test", "body": "hello", "userId": 1})
     print(f"  created id={created.get('id')}  title={created.get('title')}")
 
     # ── offset pagination ─────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ def main():
     # ── error handling demo ───────────────────────────────────────────────────
     print("\n── APIError demo: GET /posts/9999 ──")
     try:
-        client.call("GET", "/posts/9999")
+        client.get("/posts/9999")
     except APIError as e:
         print(f"  Caught APIError (status={e.status}): {e}")
 
