@@ -11,16 +11,31 @@ Typical usage::
         api_key  = os.environ.get("API_KEY", ""),
     )
 
-    # Single request
-    post = client.call("GET", "/posts/1")
+    # Single GET request
+    post = client.get("/posts/1")
+
+    # POST request (create or HubSpot-style fetch)
+    created = client.post("/posts", data={"title": "Hello", "body": "World"})
 
     # Paginated fetch — yields one page (list) at a time
     for page in client.paginate("/posts", mode="offset"):
         for item in page:
             process(item)
+
+    # HubSpot-style POST search with cursor pagination
+    for page in client.search("/crm/v3/objects/contacts/search", body={
+        "filterGroups": [{"filters": [...]}],
+        "properties": ["email"],
+    }):
+        for contact in page:
+            process(contact)
+
+    # GraphQL
+    result = client.graphql("{ user(id: 1) { name email } }")
 """
 
 import logging
+import re
 import time
 
 import requests
@@ -141,13 +156,21 @@ class APIClient:
             (``"cursor"``, ``"offset"``, or ``"page"``).
         data_key (str): Dict key that wraps the items list in paginated
             responses. Ignored when the API returns a bare JSON array.
-        cursor_key (str): Dict key carrying the next-page cursor token
-            (cursor mode only).
+        cursor_key (str): Dict key (or dot-notation path) carrying the
+            next-page cursor token. Supports nested paths such as
+            ``"paging.next.after"`` for HubSpot-style responses.
+        cursor_param (str): Query-parameter name used to send the cursor
+            on the next GET request in cursor mode. Defaults to ``"cursor"``.
+            Set to ``"after"`` for GitHub, ``"page_token"`` for Google APIs,
+            ``"starting_after"`` for Stripe, etc.
+        cursor_body_key (str): Key in the POST request body used to send
+            the cursor token on each page. Used by ``search()`` (POST-based
+            cursor pagination). Defaults to ``"after"``.
         total_key (str): Dict key carrying the total record count
             (offset mode only; used to detect the last page early).
         offset_param (str): Query-parameter name for the offset value.
         limit_param (str): Query-parameter name for the page size
-            (used by all three pagination modes).
+            (used by all pagination modes and by ``search()`` in the body).
         max_rows (int | None): Maximum total items to return across all pages.
             ``None`` means no limit (fetch everything).
         session (requests.Session): Session with retry logic and auth headers.
@@ -156,19 +179,21 @@ class APIClient:
     def __init__(
         self,
         base_url: str,
-        api_key: str         = "",
-        api_key_env: str     = "API_KEY",
-        rate_delay: float    = 6.0,
-        max_retries: int     = 4,
-        page_size: int       = 100,
-        timeout: int         = 30,
-        pagination_mode: str = "cursor",
-        data_key: str        = "data",
-        cursor_key: str      = "next_cursor",
-        total_key: str       = "total",
-        offset_param: str    = "offset",
-        limit_param: str     = "limit",
-        max_rows: int        = None,
+        api_key: str          = "",
+        api_key_env: str      = "API_KEY",
+        rate_delay: float     = 6.0,
+        max_retries: int      = 4,
+        page_size: int        = 100,
+        timeout: int          = 30,
+        pagination_mode: str  = "cursor",
+        data_key: str         = "data",
+        cursor_key: str       = "next_cursor",
+        cursor_param: str     = "cursor",
+        cursor_body_key: str  = "after",
+        total_key: str        = "total",
+        offset_param: str     = "offset",
+        limit_param: str      = "limit",
+        max_rows: int         = None,
     ):
         """Initialise the client from explicit keyword arguments.
 
@@ -179,6 +204,15 @@ class APIClient:
                 base_url = "https://api.example.com",
                 api_key  = os.environ.get("API_KEY", ""),
                 rate_delay = 0.5,
+            )
+
+            # HubSpot CRM search configuration
+            hs_client = APIClient(
+                base_url        = "https://api.hubapi.com",
+                api_key         = os.environ.get("HUBSPOT_API_KEY"),
+                data_key        = "results",
+                cursor_key      = "paging.next.after",
+                cursor_body_key = "after",
             )
         """
         log.debug(
@@ -196,10 +230,13 @@ class APIClient:
         self.pagination_mode = pagination_mode
         self.data_key        = data_key
         self.cursor_key      = cursor_key
+        self.cursor_param    = cursor_param
+        self.cursor_body_key = cursor_body_key
         self.total_key       = total_key
         self.offset_param    = offset_param
         self.limit_param     = limit_param
         self.max_rows        = max_rows
+        self.max_retries     = max_retries
         self._last_call      = 0.0
         self.session         = self._build_session(api_key, max_retries)
 
@@ -259,40 +296,94 @@ class APIClient:
     def _http_error_msg(self, method: str, path: str, status: int, body) -> str:
         """Build an actionable error message for a non-2xx HTTP response.
 
+        Each message follows a two-sentence structure: what went wrong, then
+        what to do about it. Status codes with distinct root causes and distinct
+        remediation steps get their own branch; codes with the same fix are
+        grouped (e.g. 502/503/504 are all "upstream unavailable, retry").
+
         Args:
             method (str): HTTP method (e.g. ``"GET"``).
             path (str): Request path (e.g. ``"/users/42"``).
             status (int): HTTP status code.
             body (dict | list | bytes): Parsed or raw response body,
-                included in generic 4xx messages for debugging.
+                appended to messages for 4xx errors to aid debugging.
 
         Returns:
             str: Human-readable message with a specific remediation hint.
         """
         tag = f"[{method} {path}] HTTP {status}"
-        if status in (401, 403):
+        if status == 400:
             return (
-                f"{tag} — Authentication failed. "
-                f"Check your API key or token (env var '{self.api_key_env}')."
+                f"{tag} — The server rejected the request as malformed or missing required fields. "
+                f"Check the request body and parameters against the API documentation. "
+                f"Response: {body!r}"
+            )
+        if status == 401:
+            return (
+                f"{tag} — Authentication credentials were missing or rejected by the server. "
+                f"Pass a valid API key via the 'api_key' argument "
+                f"(env var '{self.api_key_env}')."
+            )
+        if status == 403:
+            return (
+                f"{tag} — Access to this resource was denied despite valid credentials. "
+                f"Your account lacks the required permission; check the API's "
+                f"access-control settings or contact the API owner."
             )
         if status == 404:
-            return f"{tag} — Endpoint not found. Verify the path and resource ID."
+            return (
+                f"{tag} — The requested resource does not exist at this path. "
+                f"Verify the path and resource ID are correct and the resource "
+                f"has not been deleted."
+            )
+        if status == 422:
+            return (
+                f"{tag} — The request was understood but the data failed validation. "
+                f"Review the field requirements and constraints for this endpoint. "
+                f"Response: {body!r}"
+            )
+        if status == 429:
+            return (
+                f"{tag} — The API rejected this request because the rate limit was reached. "
+                f"Increase 'rate_delay' to add more spacing between requests, "
+                f"or reduce concurrency."
+            )
+        if status == 500:
+            return (
+                f"{tag} — The server encountered an internal error processing the request. "
+                f"This is a bug on the API's side; report it to the maintainer "
+                f"or check their status page."
+            )
+        if status in (502, 503, 504):
+            return (
+                f"{tag} — The API gateway or upstream service is temporarily unavailable. "
+                f"Wait a few minutes and retry, or check the API status page."
+            )
+        if 400 <= status <= 499:
+            return (
+                f"{tag} — Client error: the server could not process this request. "
+                f"Check the request parameters and body. Response: {body!r}"
+            )
         if 500 <= status <= 599:
-            return f"{tag} — Server error. Retry later or check the API status page."
-        return (
-            f"{tag} — Client error. "
-            f"Check request parameters or body. Response: {body!r}"
-        )
+            return (
+                f"{tag} — The server returned an unexpected error. "
+                f"Retry later or check the API status page."
+            )
+        return f"{tag} — Unexpected HTTP status. Response: {body!r}"
 
-    # ── single HTTP call ──────────────────────────────────────────────────────
+    # ── core HTTP request ─────────────────────────────────────────────────────
 
-    def call(self, method: str, path: str, data=None, params=None):
+    def request(self, method: str, path: str, data=None, params=None):
         """Send one HTTP request and return the parsed response.
 
         Applies rate limiting before every request. 429 and 5xx retries
         are handled transparently by the session. JSON parsing is attempted
         regardless of status so that error responses with JSON bodies produce
         richer messages; the HTTP status message always takes precedence.
+
+        Prefer the convenience methods ``get()``, ``post()``, ``put()``,
+        ``patch()``, and ``delete()`` for cleaner call sites. Use
+        ``request()`` directly when the HTTP method is determined at runtime.
 
         Args:
             method (str): HTTP method: ``"GET"``, ``"POST"``, ``"PUT"``,
@@ -315,10 +406,13 @@ class APIClient:
 
         Example::
 
-            user   = client.call("GET", "/users/42")
-            order  = client.call("POST", "/orders", data={"item_id": 1, "qty": 2})
-            result = client.call("GET", "/search", params={"q": "hello world"})
-            client.call("DELETE", "/orders/99")   # returns {}
+            # Low-level — useful when method is a variable
+            client.request("GET", "/users/42")
+            client.request("POST", "/orders", data={"item_id": 1})
+
+            # Prefer the convenience wrappers:
+            client.get("/users/42")
+            client.post("/orders", data={"item_id": 1})
         """
         self._throttle()
 
@@ -329,6 +423,23 @@ class APIClient:
             r = self.session.request(
                 method, url, params=params, json=data, timeout=self.timeout
             )
+        except requests.exceptions.RetryError as e:
+            # urllib3 exhausted retries on a status in status_forcelist (429/5xx).
+            # The status code is buried in the reason string; extract it so we can
+            # produce a specific, actionable error message instead of a generic one.
+            # responses library uses implicit chaining (__context__), not __cause__.
+            chain = e.__cause__ or e.__context__
+            reason = getattr(chain, "reason", None)
+            m = re.search(r"\b([45]\d{2})\b", str(reason) if reason is not None else str(e))
+            status = int(m.group(1)) if m else None
+            if status is not None:
+                msg = self._http_error_msg(method, path, status, None)
+                msg += f" (failed after {self.max_retries} retries)"
+                log.error(msg)
+                raise APIError(msg, status=status, body=str(e)) from e
+            msg = f"[{method} {path}] Retries exhausted — {e}"
+            log.error(msg)
+            raise APIError(msg, body=str(e)) from e
         except requests.RequestException as e:
             msg = f"[{method} {path}] Request failed — {type(e).__name__}: {e}"
             log.error(msg)
@@ -363,6 +474,223 @@ class APIClient:
         log.debug("%s %s: parsed response (%d bytes)", method, path, len(r.content))
         return payload
 
+    # ── HTTP method convenience wrappers ──────────────────────────────────────
+
+    def get(self, path: str, params=None):
+        """Send a GET request and return the parsed response.
+
+        Args:
+            path (str): Endpoint path (e.g. ``"/users/42"``).
+            params (dict, optional): Query-string parameters.
+
+        Returns:
+            dict | list: Parsed JSON response body.
+
+        Raises:
+            APIError: On HTTP errors or non-JSON response bodies.
+
+        Example::
+
+            user   = client.get("/users/42")
+            result = client.get("/search", params={"q": "hello world"})
+        """
+        return self.request("GET", path, params=params)
+
+    def post(self, path: str, data=None, params=None):
+        """Send a POST request and return the parsed response.
+
+        Used for creating resources and for APIs (like HubSpot CRM search)
+        that use POST to fetch data.
+
+        Args:
+            path (str): Endpoint path (e.g. ``"/orders"``).
+            data (dict, optional): Request body, serialised to JSON.
+            params (dict, optional): Query-string parameters.
+
+        Returns:
+            dict | list: Parsed JSON response body.
+
+        Raises:
+            APIError: On HTTP errors or non-JSON response bodies.
+
+        Example::
+
+            order = client.post("/orders", data={"item_id": 1, "qty": 2})
+
+            # HubSpot CRM search — POST to fetch data
+            result = client.post("/crm/v3/objects/contacts/search", data={
+                "filterGroups": [...],
+                "properties": ["email"],
+                "limit": 100,
+            })
+        """
+        return self.request("POST", path, data=data, params=params)
+
+    def put(self, path: str, data=None, params=None):
+        """Send a PUT request and return the parsed response.
+
+        Args:
+            path (str): Endpoint path (e.g. ``"/users/42"``).
+            data (dict, optional): Request body, serialised to JSON.
+            params (dict, optional): Query-string parameters.
+
+        Returns:
+            dict | list: Parsed JSON response body.
+
+        Raises:
+            APIError: On HTTP errors or non-JSON response bodies.
+
+        Example::
+
+            updated = client.put("/users/42", data={"name": "Alice"})
+        """
+        return self.request("PUT", path, data=data, params=params)
+
+    def patch(self, path: str, data=None, params=None):
+        """Send a PATCH request and return the parsed response.
+
+        Args:
+            path (str): Endpoint path (e.g. ``"/users/42"``).
+            data (dict, optional): Partial update body, serialised to JSON.
+            params (dict, optional): Query-string parameters.
+
+        Returns:
+            dict | list: Parsed JSON response body.
+
+        Raises:
+            APIError: On HTTP errors or non-JSON response bodies.
+
+        Example::
+
+            patched = client.patch("/users/42", data={"email": "new@example.com"})
+        """
+        return self.request("PATCH", path, data=data, params=params)
+
+    def delete(self, path: str, params=None):
+        """Send a DELETE request and return the parsed response.
+
+        Args:
+            path (str): Endpoint path (e.g. ``"/orders/99"``).
+            params (dict, optional): Query-string parameters.
+
+        Returns:
+            dict: ``{}`` on HTTP 204 or empty body; parsed JSON otherwise.
+
+        Raises:
+            APIError: On HTTP errors.
+
+        Example::
+
+            client.delete("/orders/99")
+        """
+        return self.request("DELETE", path, params=params)
+
+    def graphql(self, query: str, variables=None, path: str = "/graphql"):
+        """Execute a GraphQL query via HTTP POST.
+
+        GraphQL APIs accept queries as POST requests with a JSON body
+        containing ``query`` and optionally ``variables``. This method
+        wraps ``post()`` with the standard GraphQL envelope.
+
+        Rate limiting, retries, and error handling are inherited from
+        ``request()``. For paginated GraphQL responses, call ``graphql()``
+        in a loop and extract the cursor from the response yourself.
+
+        Args:
+            query (str): GraphQL query or mutation string.
+            variables (dict, optional): Variable bindings for the query.
+                Defaults to ``{}``.
+            path (str, optional): GraphQL endpoint path. Defaults to
+                ``"/graphql"``.
+
+        Returns:
+            dict: Full GraphQL response, typically ``{"data": {...}}``.
+                Errors are surfaced via the ``"errors"`` key; this method
+                does not raise on GraphQL-level errors, only HTTP errors.
+
+        Raises:
+            APIError: On HTTP errors or non-JSON response bodies.
+
+        Example::
+
+            # Simple query
+            result = client.graphql("{ viewer { login } }")
+            print(result["data"]["viewer"]["login"])
+
+            # Query with variables
+            result = client.graphql(
+                query     = "query GetUser($id: ID!) { user(id: $id) { name } }",
+                variables = {"id": "42"},
+            )
+
+            # Custom endpoint path
+            result = client.graphql("{ products { id name } }", path="/api/graphql")
+        """
+        result = self.post(path, data={"query": query, "variables": variables or {}})
+        if isinstance(result, dict) and result.get("errors"):
+            log.warning("[GraphQL %s] Response contains errors: %s", path, result["errors"])
+        return result
+
+    # ── POST-based search / pagination (HubSpot CRM style) ───────────────────
+
+    def search(self, path: str, body=None, page_size: int = None,
+               max_rows: int = None):
+        """POST-based cursor pagination for HubSpot-style search APIs.
+
+        HubSpot CRM search endpoints accept filter criteria in the POST body
+        and return a cursor in the response (e.g. ``paging.next.after``).
+        Each subsequent page sends the cursor back in the POST body using
+        ``cursor_body_key`` (default ``"after"``).
+
+        Configure the client for HubSpot::
+
+            client = APIClient(
+                base_url        = "https://api.hubapi.com",
+                api_key         = os.environ.get("HUBSPOT_API_KEY"),
+                data_key        = "results",           # HubSpot wraps items here
+                cursor_key      = "paging.next.after", # dot-notation nested path
+                cursor_body_key = "after",             # key in the next POST body
+            )
+
+            for page in client.search(
+                "/crm/v3/objects/contacts/search",
+                body = {
+                    "filterGroups": [{"filters": [
+                        {"propertyName": "email", "operator": "CONTAINS_TOKEN",
+                         "value": "example.com"},
+                    ]}],
+                    "properties": ["email", "firstname", "lastname"],
+                },
+                max_rows = 500,
+            ):
+                for contact in page:
+                    process(contact)
+
+        Args:
+            path (str): Endpoint path (e.g.
+                ``"/crm/v3/objects/contacts/search"``).
+            body (dict, optional): Initial POST body (filter criteria,
+                properties, sorts, etc.). The ``limit`` key is added
+                automatically from ``page_size``. Do not include the cursor
+                key here; it is managed internally.
+            page_size (int, optional): Items per page for this call only.
+                Overrides the constructor ``page_size``.
+            max_rows (int, optional): Total-item cap for this call only.
+                Overrides the constructor ``max_rows``.
+
+        Yields:
+            list: One page of items.
+
+        Raises:
+            APIError: Propagated from ``post()`` on HTTP errors.
+        """
+        limit = max_rows if max_rows is not None else self.max_rows
+        log.debug(
+            "Starting search pagination: path=%s  page_size=%s  max_rows=%s",
+            path, page_size or self.page_size, limit,
+        )
+        yield from self._paginate_search(path, body or {}, page_size, limit)
+
     # ── pagination helpers ────────────────────────────────────────────────────
 
     def _items(self, res) -> list:
@@ -373,7 +701,7 @@ class APIClient:
         (``data_key``). Returns an empty list if the key is absent.
 
         Args:
-            res (dict | list): Parsed response returned by ``call()``.
+            res (dict | list): Parsed response returned by ``request()``.
 
         Returns:
             list: The extracted items, or ``[]`` if the wrapper key is absent.
@@ -386,13 +714,46 @@ class APIClient:
         """Return ``res[key]`` when ``res`` is a dict, else ``None``.
 
         Args:
-            res (dict | list): Parsed response returned by ``call()``.
+            res (dict | list): Parsed response returned by ``request()``.
             key (str): Key to look up.
 
         Returns:
             Any | None: The value at ``key``, or ``None``.
         """
         return res.get(key) if isinstance(res, dict) else None
+
+    @staticmethod
+    def _deep_get(obj, key_path, default=None):
+        """Get a value from a nested dict using a dot-notation key path.
+
+        Supports both flat keys (``"next_cursor"``) and nested paths
+        (``"paging.next.after"``). Returns ``default`` if any key in the
+        path is missing or if a non-dict is encountered mid-path.
+
+        Args:
+            obj (dict | any): Starting object to traverse.
+            key_path (str): Dot-separated key path, e.g. ``"paging.next.after"``.
+            default: Value to return when the path cannot be resolved.
+                Defaults to ``None``.
+
+        Returns:
+            Any: Value at the path, or ``default``.
+
+        Example::
+
+            _deep_get({"paging": {"next": {"after": "tok"}}}, "paging.next.after")
+            # → "tok"
+
+            _deep_get({"next_cursor": "abc"}, "next_cursor")
+            # → "abc"  (flat key, same behaviour)
+        """
+        for key in key_path.split("."):
+            if not isinstance(obj, dict):
+                return default
+            obj = obj.get(key, default)
+            if obj is default:
+                return default
+        return obj
 
     def _truncate_to_limit(self, items: list, total_rows: int, max_rows) -> tuple:
         """Truncate ``items`` to the ``max_rows`` cap.
@@ -413,7 +774,7 @@ class APIClient:
             return items[:remaining], True
         return items, False
 
-    # ── pagination ────────────────────────────────────────────────────────────
+    # ── GET-based pagination ──────────────────────────────────────────────────
 
     def paginate(self, path: str, params=None, page_size: int = None,
                  mode: str = None, max_rows: int = None):
@@ -423,6 +784,9 @@ class APIClient:
         page: an empty result, a partial page, an exhausted ``total``, or
         a missing cursor. The generator never makes a speculative extra
         request beyond the last real page.
+
+        For POST-based search pagination (HubSpot CRM, etc.), use
+        ``search()`` instead.
 
         Args:
             path (str): Endpoint path (e.g. ``"/orders"``).
@@ -445,7 +809,7 @@ class APIClient:
 
         Raises:
             ValueError: If ``mode`` is not one of the three valid values.
-            APIError: Propagated from ``call()`` on HTTP errors.
+            APIError: Propagated from ``request()`` on HTTP errors.
 
         Example::
 
@@ -480,6 +844,9 @@ class APIClient:
         query parameter on the next request. Stops when the response
         contains no cursor token or returns an empty items list.
 
+        ``cursor_key`` supports dot-notation for nested response paths
+        (e.g. ``"paging.next.after"``).
+
         Suitable for: HubSpot, Stripe, Twitter/X, Salesforce, and most
         modern APIs that use opaque page tokens instead of numeric offsets.
 
@@ -500,7 +867,7 @@ class APIClient:
             while True:
                 page_num += 1
                 log.debug("Cursor: fetching page %d from %s", page_num, path)
-                res   = self.call("GET", path, params=p)
+                res   = self.request("GET", path, params=p)
                 items = self._items(res)
                 if not items:
                     log.debug("Cursor: empty response on page %d — done", page_num)
@@ -512,11 +879,11 @@ class APIClient:
                 if limit_reached:
                     log.info("max_rows (%d) reached after page %d — stopping", max_rows, page_num)
                     break
-                cursor = self._meta(res, self.cursor_key)
-                if not cursor:
+                cursor = self._deep_get(res, self.cursor_key)
+                if cursor is None or cursor == "":
                     log.debug("Cursor: no cursor after page %d — done", page_num)
                     break
-                p["cursor"] = cursor
+                p[self.cursor_param] = cursor
         finally:
             log.info(
                 "Cursor pagination complete: %s — %d page(s), %d rows total",
@@ -557,7 +924,7 @@ class APIClient:
                     page_num, offset, size, path,
                 )
                 p[self.offset_param] = offset
-                res   = self.call("GET", path, params=p)
+                res   = self.request("GET", path, params=p)
                 items = self._items(res)
                 if not items:
                     log.debug("Offset: empty response on page %d — done", page_num)
@@ -569,7 +936,7 @@ class APIClient:
                 if limit_reached:
                     log.info("max_rows (%d) reached after page %d — stopping", max_rows, page_num)
                     break
-                total = self._meta(res, self.total_key)
+                total = self._deep_get(res, self.total_key)
                 if total is not None:
                     try:
                         total = int(total)
@@ -621,7 +988,7 @@ class APIClient:
             while True:
                 log.debug("Page: fetching page %d from %s", page, path)
                 p["page"] = page
-                res   = self.call("GET", path, params=p)
+                res   = self.request("GET", path, params=p)
                 items = self._items(res)
                 if not items:
                     log.debug("Page: empty response on page %d — done", page)
@@ -644,4 +1011,52 @@ class APIClient:
             log.info(
                 "Page pagination complete: %s — %d page(s), %d rows total",
                 path, page, total_rows,
+            )
+
+    def _paginate_search(self, path, body, page_size, max_rows):
+        """POST-based cursor pagination implementation (HubSpot CRM search style).
+
+        Each page is a POST request. The cursor token is read from the
+        response using ``cursor_key`` (supports dot-notation), and sent
+        in the next POST body under ``cursor_body_key``.
+
+        Args:
+            path (str): Endpoint path.
+            body (dict): Initial POST body (filters, sorts, properties, etc.).
+            page_size (int | None): Items per page; falls back to
+                ``self.page_size``.
+            max_rows (int | None): Total-item cap; ``None`` means no limit.
+
+        Yields:
+            list: Items from each page.
+        """
+        size       = page_size or self.page_size
+        b          = {**body, self.limit_param: size}
+        page_num   = 0
+        total_rows = 0
+        try:
+            while True:
+                page_num += 1
+                log.debug("Search: fetching page %d from %s", page_num, path)
+                res   = self.post(path, data=b)
+                items = self._items(res)
+                if not items:
+                    log.debug("Search: empty response on page %d — done", page_num)
+                    break
+                items, limit_reached = self._truncate_to_limit(items, total_rows, max_rows)
+                log.debug("Search: page %d → %d items", page_num, len(items))
+                total_rows += len(items)
+                yield items
+                if limit_reached:
+                    log.info("max_rows (%d) reached after page %d — stopping", max_rows, page_num)
+                    break
+                cursor = self._deep_get(res, self.cursor_key)
+                if cursor is None or cursor == "":
+                    log.debug("Search: no cursor after page %d — done", page_num)
+                    break
+                b[self.cursor_body_key] = cursor
+        finally:
+            log.info(
+                "Search pagination complete: %s — %d page(s), %d rows total",
+                path, page_num, total_rows,
             )

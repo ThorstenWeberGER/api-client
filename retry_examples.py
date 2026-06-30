@@ -98,7 +98,7 @@ def fetch_data_with_client(base_url, path):
     (which covers network failures and transient server errors).
     """
     client = APIClient(base_url=base_url)
-    return client.call("GET", path)
+    return client.get(path)
 
 
 # ── Example 5: Retry with custom logging/callbacks ─────────────────────────
