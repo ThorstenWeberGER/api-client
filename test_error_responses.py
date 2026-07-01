@@ -24,14 +24,16 @@ import json
 import unittest
 from unittest.mock import MagicMock
 
+# Import the custom API client and custom error class being tested
 from api_client import APIClient, APIError
 
-
+# Define a constant base URL for the mocked API requests
 BASE = "https://api.test.example"
 
 
 def make_client(**overrides):
     """Build an APIClient with a mocked session."""
+    # Define standard configuration settings for the test client
     defaults = dict(
         base_url=BASE,
         api_key="test-key",
@@ -41,36 +43,48 @@ def make_client(**overrides):
         page_size=10,
         timeout=5,
     )
+    # Allow specific test cases to overwrite default settings if needed
     defaults.update(overrides)
     client = APIClient(**defaults)
+    
+    # Replace the actual network session object with a mock to prevent real network calls
     client.session = MagicMock()
     return client
 
 
 def mock_response(status, body):
     """Build a fake requests response."""
+    # Create a mock object to simulate an HTTP response
     r = MagicMock()
     r.status_code = status
+    # Convert the Python dictionary body into a JSON string and encode it to bytes
     r.content = json.dumps(body).encode("utf-8")
+    # Configure the mock's .json() method to return the original dictionary
     r.json.return_value = body
     return r
 
 
+# Test suite targeting HTTP 400 Bad Request error scenarios
 class TestErrorClass400BadRequest(unittest.TestCase):
-    """400 — server rejected the request as malformed."""
+    """400 - server rejected the request as malformed."""
 
     def setUp(self):
+        """Runs before every individual test method to initialize the environment."""
         self.client = make_client()
+        # Pre-configure the mocked session to return a 400 Bad Request for any request made
         self.client.session.request.return_value = mock_response(
             400, {"error": "missing required field 'name'"}
         )
 
     def test_raises_api_error(self):
+        """Verify that a 400 response triggers a custom APIError exception."""
         with self.assertRaises(APIError) as ctx:
             self.client.get("/items")
+        # Assert that the status code captured in the exception is 400
         self.assertEqual(ctx.exception.status, 400)
 
     def test_message_describes_malformed_request(self):
+        """Verify the error message mentions the status code and indicates a malformed request."""
         with self.assertRaises(APIError) as ctx:
             self.client.get("/items")
         msg = str(ctx.exception)
@@ -78,25 +92,30 @@ class TestErrorClass400BadRequest(unittest.TestCase):
         self.assertIn("malformed", msg.lower())
 
     def test_message_guides_to_api_documentation(self):
+        """Verify that the error message helpfully points the user to documentation."""
         with self.assertRaises(APIError) as ctx:
             self.client.get("/items")
         self.assertIn("documentation", str(ctx.exception).lower())
 
     def test_message_includes_response_body_for_debugging(self):
+        """Verify that custom JSON error codes from the server are visible in the message."""
         body = {"error": "missing required field 'name'", "code": "INVALID_INPUT"}
+        # Temporarily overwrite the response structure for this specific test
         self.client.session.request.return_value = mock_response(400, body)
         with self.assertRaises(APIError) as ctx:
             self.client.get("/items")
         self.assertIn("INVALID_INPUT", str(ctx.exception))
 
     def test_body_accessible_on_exception(self):
+        """Verify the raw JSON payload is directly attached to the exception object."""
         body = {"error": "bad input"}
+        # Overwrite the response structure to test a POST context
         self.client.session.request.return_value = mock_response(400, body)
         with self.assertRaises(APIError) as ctx:
             self.client.post("/orders", data={"qty": -1})
+        # Check if the exception object exposes the exact server response body
         self.assertEqual(ctx.exception.body, body)
-
-
+        
 class TestErrorClass401Unauthorized(unittest.TestCase):
     """401 — missing or rejected credentials."""
 
